@@ -1,0 +1,7 @@
+build64/
+dist64/
+build/
+dist/
+*.pdb
+*.map
+*.ilk
