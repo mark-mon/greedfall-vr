@@ -51,7 +51,9 @@ struct Settings {
     bool prevFramePose = true;
     bool prevVpCopy = true;
     bool layoutMerge = true;
-    bool layoutRepair = true;           // menu (Debug): a VS that took the previous frame's VP as its camera is switched to the current one
+    bool layoutRepair = true;
+    bool mousePointer = false;          // menu (HUD): draw the game's mouse pointer on the menu / HUD panel while Windows shows it
+    float mousePointerSize = 0.5f;      // menu (HUD): pointer size relative to a 1080p screen           // menu (Debug): a VS that took the previous frame's VP as its camera is switched to the current one
     std::string debugLayoutPoison;      // test aid: VS hash whose first layout search skips rows 0-11
     bool skipBigCb = true;
     bool lockFree = true;

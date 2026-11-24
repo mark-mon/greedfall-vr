@@ -46,7 +46,8 @@ to `gfvr_config.txt`.
 - **Comfort**: remove head bob, remove camera shake, keep dynamic resolution off.
 - **Enhancements**: sharpening, **Foveated rendering (VRS)** 0-3, **Foveation eye tracking**, VRS ring sizes, depth of
   field (off by default), draw distance, culling FOV / margin, TAA jitter, game camera follows head.
-- **HUD**: HUD on its own floating panel (default) or in the view, HUD distance / width / height, menu screen size.
+- **HUD**: HUD on its own floating panel (default) or in the view, HUD distance / width / height, menu screen size,
+  **Mouse pointer in menus** (for keyboard + mouse players) and its size.
 - **Debug**: switches used to isolate problems, frame capture, headset image save. You should not need these.
 - **Controls**: which pad buttons open the menu.
 

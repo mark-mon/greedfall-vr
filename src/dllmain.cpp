@@ -183,6 +183,8 @@ static void LoadSettings() {
     s.prevVpCopy = c.GetBool("prev_vp_copy", true);
     s.layoutMerge = c.GetBool("layout_merge", true);
     s.layoutRepair = c.GetBool("layout_repair", true);
+    s.mousePointer = c.GetBool("mouse_pointer", false);
+    s.mousePointerSize = c.GetFloat("mouse_pointer_size", 0.5f);
     s.debugLayoutPoison = c.GetStr("debug_layout_poison", "");
     s.skipBigCb = c.GetBool("skip_big_cb", true);
     s.lockFree = c.GetBool("lock_free", true);

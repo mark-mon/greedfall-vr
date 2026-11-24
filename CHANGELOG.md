@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+- Mouse pointer in menus (VR menu > HUD > "Mouse pointer in menus", off by default, plus "Mouse pointer size"): the
+  game's own pointer is drawn on the HUD panel / flat screen whenever the game shows it (inventory, level-up, map,
+  title menu). While it is on, the whole monitor maps onto the whole game window (which is the headset's size and
+  usually larger than the monitor), so every part of a menu can be reached and clicked.
+
 ## 1.0-rc1 (2026-11-21)
 First public release candidate.
 - Native stereo for all 16 render threads, head tracking, HUD panel, VR settings menu (Insert / L3+R3).

@@ -115,6 +115,11 @@ void RegisterGF() {
     o.AddFloat("HUD", "screen_distance", "Screen distance (m)", &s.screenDistance, 1.f, 10.f, 0.1f, 1,
                "Menus, loading screens and movies: distance of the flat screen.", ApplyScreen);
     o.AddFloat("HUD", "screen_width", "Screen width (m)", &s.screenWidth, 1.f, 10.f, 0.1f, 1, "Width of the flat screen.", ApplyScreen);
+    o.AddBool("HUD", "mouse_pointer", "Mouse pointer in menus", &s.mousePointer,
+              "Off (default). On = the game's mouse pointer is drawn on the menu / HUD panel whenever the game shows it "
+              "(inventory, level-up, map, title menu), for keyboard + mouse players. Hidden in normal gameplay.");
+    o.AddFloat("HUD", "mouse_pointer_size", "Mouse pointer size", &s.mousePointerSize, 0.5f, 4.f, 0.1f, 1,
+               "Size of the mouse pointer on the panel (1.0 = as on a 1080p monitor).");
     // ---- Debug: test switches (all take effect at once - no restart)
     o.AddBool("Debug", "cb_decl_filter", "Patch declared buffers only", &s.cbDeclFilter,
               "On = the headset camera is only written into constant buffers a shader really uses as such (fix for phantom "

@@ -695,7 +695,8 @@ struct Stats11 { uint64_t frames = 0, stereo = 0, patched = 0, right = 0, mirror
 
 // eye textures (composite target): back-buffer sized, typeless so views can match the game's back-buffer view format
 ID3D11Texture2D* g_eyeTex[2] = {};
-ID3D11Texture2D* g_hudTex = nullptr;   // UI drawn after the scene composite (transparent, premultiplied): the HUD layer
+ID3D11Texture2D* g_hudTex = nullptr;
+long g_hudConvFrame = -1;   // frame of the last UI -> HUD conversion (the mouse pointer is drawn only onto a fresh HUD)   // UI drawn after the scene composite (transparent, premultiplied): the HUD layer
 struct HudRtv { DXGI_FORMAT f; ID3D11RenderTargetView* v; };
 std::vector<HudRtv> g_hudRtv;
 std::unordered_map<ID3D11BlendState*, ID3D11BlendState*> g_hudBlend;   // game blend state -> same with alpha accumulation
@@ -739,6 +740,208 @@ static DXGI_FORMAT UnormOf(DXGI_FORMAT tf) {
     default: return tf;
     }
 }
+
+// ---- Mouse pointer on the panel (VR menu HUD > "Mouse pointer in menus"): keyboard + mouse players can see where the
+// pointer is in the inventory / level-up / title menus. Drawn only while Windows shows the game's pointer (the game hides
+// it in gameplay); the image is the game's own pointer (GetCursorInfo), converted to a premultiplied texture.
+// Recon (always on, cheap): which Windows mouse functions / messages the game uses, logged with the status.
+extern ID3D11SamplerState* g_linSamp;
+extern HWND g_scHwnd;
+namespace mouse {
+struct Cnt { volatile LONG getPos = 0, setPos = 0, show = 0, setCur = 0, clip = 0, move = 0, input = 0, setCurMsg = 0; } g_c, g_last;
+volatile LONG g_showArg = 0;
+typedef BOOL(WINAPI* GetCursorPos_t)(LPPOINT); GetCursorPos_t o_GetCursorPos = nullptr;
+typedef BOOL(WINAPI* SetCursorPos_t)(int, int); SetCursorPos_t o_SetCursorPos = nullptr;
+typedef int(WINAPI* ShowCursor_t)(BOOL); ShowCursor_t o_ShowCursor = nullptr;
+typedef HCURSOR(WINAPI* SetCursor_t)(HCURSOR); SetCursor_t o_SetCursor = nullptr;
+typedef BOOL(WINAPI* ClipCursor_t)(const RECT*); ClipCursor_t o_ClipCursor = nullptr;
+static void First(const char* what, void* ret, const char* extra) {
+    HMODULE m = nullptr; char nm[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)ret, &m) && m) {
+        GetModuleFileNameA(m, nm, MAX_PATH);
+    }
+    const char* b = strrchr(nm, '\\');
+    LOGI("mouse: game calls %s %s (from %s+%llx)", what, extra, b ? b + 1 : nm, (unsigned long long)((uintptr_t)ret - (uintptr_t)m));
+}
+// The game window (headset resolution, e.g. 3184x2738) is usually larger than the monitor, and Windows keeps the real
+// pointer on the monitor: the lower / right part of a menu could not be reached. While the pointer option is on, the
+// whole monitor maps onto the whole game window: GetCursorPos returns the scaled position, SetCursorPos (the game centres
+// the pointer when a menu opens) is mapped back. Only when the window is larger than its monitor and in front.
+static bool Scaling(RECT& mon, POINT& org, SIZE& cl) {
+    HWND h = g_scHwnd;
+    if (!G().s.mousePointer || !h || GetForegroundWindow() != h) return false;
+    RECT cr{}; if (!GetClientRect(h, &cr) || cr.right <= 0 || cr.bottom <= 0) return false;
+    MONITORINFO mi{sizeof mi}; if (!GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi)) return false;
+    mon = mi.rcMonitor; org = {0, 0}; ClientToScreen(h, &org); cl = {cr.right, cr.bottom};
+    return cl.cx > mon.right - mon.left || cl.cy > mon.bottom - mon.top;
+}
+POINT ToGame(POINT real) {   // real screen position -> the screen position the game sees
+    RECT m; POINT o; SIZE c;
+    if (!Scaling(m, o, c)) return real;
+    LONG mw = m.right - m.left, mh = m.bottom - m.top;
+    return {o.x + (LONG)((long long)(real.x - m.left) * c.cx / std::max(mw - 1, 1L)), o.y + (LONG)((long long)(real.y - m.top) * c.cy / std::max(mh - 1, 1L))};
+}
+BOOL WINAPI Hk_GetCursorPos(LPPOINT p) {
+    if (InterlockedIncrement(&g_c.getPos) == 1) First("GetCursorPos", _ReturnAddress(), "");
+    BOOL r = o_GetCursorPos(p);
+    if (r && p) *p = ToGame(*p);
+    return r;
+}
+BOOL WINAPI Hk_SetCursorPos(int x, int y) {
+    if (InterlockedIncrement(&g_c.setPos) <= 3) { char e[48]; sprintf_s(e, "(%d, %d)", x, y); First("SetCursorPos", _ReturnAddress(), e); }
+    RECT m; POINT o; SIZE c;
+    if (Scaling(m, o, c)) {
+        LONG mw = m.right - m.left, mh = m.bottom - m.top;
+        x = m.left + (int)((long long)(x - o.x) * (mw - 1) / c.cx); y = m.top + (int)((long long)(y - o.y) * (mh - 1) / c.cy);
+    }
+    return o_SetCursorPos(x, y);
+}
+int WINAPI Hk_ShowCursor(BOOL b) { int r = o_ShowCursor(b); InterlockedExchange(&g_showArg, b ? 1 : 0); if (InterlockedIncrement(&g_c.show) <= 6) { char e[48]; sprintf_s(e, "(%d) -> count %d", b, r); First("ShowCursor", _ReturnAddress(), e); } return r; }
+HCURSOR WINAPI Hk_SetCursor(HCURSOR h) { if (InterlockedIncrement(&g_c.setCur) <= 3) { char e[48]; sprintf_s(e, "(%p)", (void*)h); First("SetCursor", _ReturnAddress(), e); } return o_SetCursor(h); }
+BOOL WINAPI Hk_ClipCursor(const RECT* r) { if (InterlockedIncrement(&g_c.clip) <= 3) { char e[80]; if (r) sprintf_s(e, "(%ld %ld %ld %ld)", r->left, r->top, r->right, r->bottom); else strcpy_s(e, "(none)"); First("ClipCursor", _ReturnAddress(), e); } return o_ClipCursor(r); }
+static WNDPROC g_oldProc = nullptr; static HWND g_procHwnd = nullptr;
+LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_MOUSEMOVE) InterlockedIncrement(&g_c.move);
+    else if (m == WM_INPUT) InterlockedIncrement(&g_c.input);
+    else if (m == WM_SETCURSOR) InterlockedIncrement(&g_c.setCurMsg);
+    return CallWindowProcW(g_oldProc, h, m, w, l);
+}
+static bool g_hooked = false;
+void Install(HWND hwnd) {
+    if (!g_hooked) {
+        g_hooked = true;
+        HMODULE u = GetModuleHandleA("user32.dll");
+        auto H = [&](const char* n, void* fn, void** o) { void* p = u ? (void*)GetProcAddress(u, n) : nullptr; if (p && MH_CreateHook(p, fn, o) == MH_OK) MH_EnableHook(p); };
+        H("GetCursorPos", (void*)&Hk_GetCursorPos, (void**)&o_GetCursorPos);
+        H("SetCursorPos", (void*)&Hk_SetCursorPos, (void**)&o_SetCursorPos);
+        H("ShowCursor", (void*)&Hk_ShowCursor, (void**)&o_ShowCursor);
+        H("SetCursor", (void*)&Hk_SetCursor, (void**)&o_SetCursor);
+        H("ClipCursor", (void*)&Hk_ClipCursor, (void**)&o_ClipCursor);
+        LOGI("mouse: watching the game's mouse functions");
+    }
+    if (hwnd && hwnd != g_procHwnd) {
+        g_procHwnd = hwnd;
+        g_oldProc = (WNDPROC)SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)&WndProc);
+    }
+}
+static int g_showFrames = 0, g_frames = 0; static HCURSOR g_seenCur = nullptr;
+void Status() {
+    RECT cr{}; if (g_procHwnd) GetClientRect(g_procHwnd, &cr);
+    MONITORINFO mi{sizeof mi}; GetMonitorInfoW(MonitorFromWindow(g_procHwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    auto D = [](volatile LONG& a, volatile LONG& b) { LONG v = a, r = v - b; b = v; return r; };
+    LOGI("mouse: pointer shown %d of %d frames (%s), per 10 s: GetCursorPos %ld, SetCursorPos %ld, ShowCursor %ld (last %ld), SetCursor %ld, "
+         "ClipCursor %ld, WM_MOUSEMOVE %ld, WM_INPUT %ld, WM_SETCURSOR %ld; window %ldx%ld, monitor %ldx%ld",
+         g_showFrames, g_frames, g_seenCur == LoadCursor(nullptr, IDC_ARROW) ? "Windows arrow" : g_seenCur ? "game's own pointer" : "none",
+         D(g_c.getPos, g_last.getPos), D(g_c.setPos, g_last.setPos), D(g_c.show, g_last.show), (long)g_showArg, D(g_c.setCur, g_last.setCur),
+         D(g_c.clip, g_last.clip), D(g_c.move, g_last.move), D(g_c.input, g_last.input), D(g_c.setCurMsg, g_last.setCurMsg),
+         cr.right, cr.bottom, mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top);
+    { RECT m; POINT o; SIZE c; if (Scaling(m, o, c)) LOGI("mouse: monitor %ldx%ld mapped onto the %ldx%ld game window", m.right - m.left, m.bottom - m.top, c.cx, c.cy); }
+    g_showFrames = g_frames = 0;
+}
+// pointer image -> premultiplied RGBA texture (drawn over black and over white: alpha from the difference)
+static HCURSOR g_texFor = nullptr; static ID3D11Texture2D* g_tex = nullptr; static ID3D11ShaderResourceView* g_srv = nullptr;
+static int g_w = 0, g_h = 0, g_hx = 0, g_hy = 0;
+static ID3D11PixelShader* g_ps = nullptr; static ID3D11BlendState* g_blend = nullptr; static bool g_failed = false;
+static ID3D11Texture2D* g_rtFor = nullptr; static ID3D11RenderTargetView* g_rtv = nullptr;
+static bool MakeTex(ID3D11Device* dev, HCURSOR h) {
+    if (g_srv) g_srv->Release(); if (g_tex) g_tex->Release(); g_srv = nullptr; g_tex = nullptr; g_texFor = nullptr;
+    ICONINFO ii{}; if (!GetIconInfo(h, &ii)) return false;
+    BITMAP bm{}; int w = 32, hh = 32;
+    if (ii.hbmColor && GetObject(ii.hbmColor, sizeof bm, &bm)) { w = bm.bmWidth; hh = bm.bmHeight; }
+    else if (ii.hbmMask && GetObject(ii.hbmMask, sizeof bm, &bm)) { w = bm.bmWidth; hh = bm.bmHeight / 2; }
+    g_hx = ii.xHotspot; g_hy = ii.yHotspot;
+    if (ii.hbmColor) DeleteObject(ii.hbmColor); if (ii.hbmMask) DeleteObject(ii.hbmMask);
+    if (w < 1 || hh < 1 || w > 256 || hh > 256) return false;
+    BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof bi.bmiHeader; bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -hh;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    HDC dc = CreateCompatibleDC(nullptr); uint32_t* px[2] = {}; HBITMAP bmp[2] = {};
+    for (int k = 0; k < 2; ++k) {
+        bmp[k] = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void**)&px[k], nullptr, 0);
+        if (!bmp[k]) continue;
+        HGDIOBJ old = SelectObject(dc, bmp[k]);
+        for (int i = 0; i < w * hh; ++i) px[k][i] = k ? 0x00FFFFFF : 0;
+        DrawIconEx(dc, 0, 0, h, w, hh, 0, nullptr, DI_NORMAL);
+        GdiFlush(); SelectObject(dc, old);
+    }
+    std::vector<uint32_t> rgba(w * hh);
+    bool ok = bmp[0] && bmp[1];
+    for (int i = 0; ok && i < w * hh; ++i) {
+        uint32_t b = px[0][i], wt = px[1][i];
+        int a = 255 - (((int)((wt >> 16) & 255) - (int)((b >> 16) & 255) + (int)((wt >> 8) & 255) - (int)((b >> 8) & 255) + (int)(wt & 255) - (int)(b & 255)) / 3);
+        a = a < 0 ? 0 : a > 255 ? 255 : a;
+        uint32_t r = (b >> 16) & 255, g = (b >> 8) & 255, bl = b & 255;   // over black = colour x alpha (premultiplied)
+        rgba[i] = r | (g << 8) | (bl << 16) | ((uint32_t)a << 24);
+    }
+    for (auto x : bmp) if (x) DeleteObject(x);
+    DeleteDC(dc);
+    if (!ok) return false;
+    D3D11_TEXTURE2D_DESC d{}; d.Width = w; d.Height = hh; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.SampleDesc = {1, 0}; d.Usage = D3D11_USAGE_IMMUTABLE; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA sd{rgba.data(), (UINT)w * 4, 0};
+    if (FAILED(o_D11CreateTexture2D(dev, &d, &sd, &g_tex)) || FAILED(dev->CreateShaderResourceView(g_tex, nullptr, &g_srv))) return false;
+    g_w = w; g_h = hh; g_texFor = h;
+    LOGI("mouse: pointer image %dx%d, hot spot %d,%d (%s)", w, hh, g_hx, g_hy, h == LoadCursor(nullptr, IDC_ARROW) ? "Windows arrow" : "the game's own pointer");
+    return true;
+}
+// draw onto tex (the panel: flat screen copy or the HUD texture), w x h
+void Draw(ID3D11Device* dev, ID3D11DeviceContext* c, ID3D11Texture2D* tex, UINT w, UINT h) {
+    ++g_frames;
+    CURSORINFO ci{sizeof ci};
+    if (!G().s.mousePointer || g_failed || !tex || !g_procHwnd || !GetCursorInfo(&ci) || !(ci.flags & CURSOR_SHOWING) || !ci.hCursor) return;
+    POINT pt = ToGame(ci.ptScreenPos); ScreenToClient(g_procHwnd, &pt);
+    RECT cr{}; GetClientRect(g_procHwnd, &cr);
+    if (cr.right <= 0 || cr.bottom <= 0 || pt.x < 0 || pt.y < 0 || pt.x >= cr.right || pt.y >= cr.bottom) return;
+    ++g_showFrames; g_seenCur = ci.hCursor;
+    if (!EnsureFsShaders()) return;
+    if (ci.hCursor != g_texFor && !MakeTex(dev, ci.hCursor)) { g_texFor = ci.hCursor; return; }
+    if (!g_srv) return;
+    if (!g_ps) {
+        typedef HRESULT(WINAPI* Compile_t)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+        HMODULE m = LoadLibraryA("d3dcompiler_47.dll"); Compile_t comp = m ? (Compile_t)GetProcAddress(m, "D3DCompile") : nullptr;
+        const char* ps = "Texture2D t : register(t0); SamplerState s : register(s0); float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target { return t.Sample(s, uv); }";
+        ID3DBlob *b = nullptr, *err = nullptr;
+        if (!comp || FAILED(comp(ps, strlen(ps), nullptr, nullptr, nullptr, "main", "ps_4_0", 0, 0, &b, &err)) ||
+            FAILED(dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_ps))) {
+            LOGW("mouse: pointer shader failed"); if (err) err->Release(); if (b) b->Release(); g_failed = true; return;
+        }
+        b->Release();
+        D3D11_BLEND_DESC bd{}; auto& rt = bd.RenderTarget[0];
+        rt.BlendEnable = TRUE; rt.SrcBlend = D3D11_BLEND_ONE; rt.DestBlend = D3D11_BLEND_INV_SRC_ALPHA; rt.BlendOp = D3D11_BLEND_OP_ADD;
+        rt.SrcBlendAlpha = D3D11_BLEND_ONE; rt.DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA; rt.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        rt.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        if (FAILED(dev->CreateBlendState(&bd, &g_blend))) { g_failed = true; return; }
+    }
+    if (g_rtFor != tex) {
+        if (g_rtv) g_rtv->Release(); g_rtv = nullptr; g_rtFor = nullptr;
+        D3D11_TEXTURE2D_DESC d{}; tex->GetDesc(&d);
+        D3D11_RENDER_TARGET_VIEW_DESC rv{}; rv.Format = UnormOf(d.Format); rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        if (!(d.BindFlags & D3D11_BIND_RENDER_TARGET) || FAILED(dev->CreateRenderTargetView(tex, &rv, &g_rtv))) { LOGW("mouse: panel %ux%u format %d is not drawable", d.Width, d.Height, (int)d.Format); g_failed = true; return; }
+        g_rtFor = tex;
+    }
+    // size: as on a 1080p screen, times the menu setting; position: client pixel -> panel pixel
+    float sc = h / 1080.f * G().s.mousePointerSize;
+    float x = pt.x * (float)w / cr.right - g_hx * sc, y = pt.y * (float)h / cr.bottom - g_hy * sc;
+    Bypass11 bp;
+    ID3D11VertexShader* vs = nullptr; ID3D11PixelShader* ps = nullptr; ID3D11InputLayout* il = nullptr; D3D11_PRIMITIVE_TOPOLOGY topo;
+    ID3D11BlendState* bs = nullptr; FLOAT bf[4]; UINT mask = 0; ID3D11DepthStencilState* ds = nullptr; UINT sref = 0; ID3D11RasterizerState* rs = nullptr;
+    UINT nvp = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE; D3D11_VIEWPORT vps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    ID3D11ShaderResourceView* srv0 = nullptr; ID3D11SamplerState* smp0 = nullptr; ID3D11RenderTargetView* rtv[8] = {}; ID3D11DepthStencilView* dsv = nullptr;
+    c->OMGetRenderTargets(8, rtv, &dsv); c->PSGetSamplers(0, 1, &smp0);
+    c->VSGetShader(&vs, nullptr, nullptr); c->PSGetShader(&ps, nullptr, nullptr); c->IAGetInputLayout(&il); c->IAGetPrimitiveTopology(&topo);
+    c->OMGetBlendState(&bs, bf, &mask); c->OMGetDepthStencilState(&ds, &sref); c->RSGetState(&rs); c->RSGetViewports(&nvp, vps); c->PSGetShaderResources(0, 1, &srv0);
+    D3D11_VIEWPORT v{x, y, g_w * sc, g_h * sc, 0, 1};
+    c->OMSetRenderTargets(1, &g_rtv, nullptr);
+    c->VSSetShader(g_fsVS, nullptr, 0); c->PSSetShader(g_ps, nullptr, 0); c->IASetInputLayout(nullptr);
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST); c->OMSetBlendState(g_blend, nullptr, 0xffffffff);
+    c->OMSetDepthStencilState(nullptr, 0); c->RSSetState(nullptr); c->RSSetViewports(1, &v); c->PSSetShaderResources(0, 1, &g_srv); c->PSSetSamplers(0, 1, &g_linSamp);
+    c->Draw(3, 0);
+    c->OMSetRenderTargets(8, rtv, dsv);
+    c->VSSetShader(vs, nullptr, 0); c->PSSetShader(ps, nullptr, 0); c->IASetInputLayout(il); c->IASetPrimitiveTopology(topo);
+    c->OMSetBlendState(bs, bf, mask); c->OMSetDepthStencilState(ds, sref); c->RSSetState(rs); c->RSSetViewports(nvp, vps); c->PSSetShaderResources(0, 1, &srv0); c->PSSetSamplers(0, 1, &smp0);
+    for (auto* r : rtv) if (r) r->Release(); if (dsv) dsv->Release(); if (smp0) smp0->Release();
+    if (vs) vs->Release(); if (ps) ps->Release(); if (il) il->Release(); if (bs) bs->Release(); if (ds) ds->Release(); if (rs) rs->Release(); if (srv0) srv0->Release();
+}
+}   // namespace mouse
 void SharpenEyes11(ID3D11DeviceContext* c) {
     float k = G().s.sharpen;
     if (k <= 0.001f || g_shFailed || !g_eyeTex[0] || !g_eyeTex[1] || !EnsureFsShaders()) return;
@@ -1280,7 +1483,7 @@ template <class F> void DrawIntoEyes(ID3D11DeviceContext* c, Ctx11* x, F draw, b
                     anyUi = true;
                     {   // the UI texture can be larger than the screen (title: 4096x2304): the conversion pass scales it
                         ID3D11RenderTargetView* hv = HudView(g_b.rtv[0]);
-                        if (inverted && hv) ConvertUiToHud(c, g_b.srv[i], hv, g_eyeW, g_eyeH);
+                        if (inverted && hv) { ConvertUiToHud(c, g_b.srv[i], hv, g_eyeW, g_eyeH); g_hudConvFrame = G().frame; }
                         else if (td.Width == g_eyeW && td.Height == g_eyeH && Typeless(td.Format) == g_eyeFmt) OC(c, CopySubresourceRegion)(c, g_hudTex, 0, 0, 0, 0, r, 0, nullptr);
                         g_f.hud++;
                         g_f.uiTex = true;
@@ -2632,6 +2835,7 @@ void VrFrame11(IDXGISwapChain* sc) {
     ID3D11Texture2D* bb = nullptr;
     if (FAILED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb)) || !bb) return;
     g_bbRes = bb;   // compared by address only (the swap chain keeps it alive)
+    mouse::Install(g_scHwnd);
     D3D11_TEXTURE2D_DESC bd{};
     bb->GetDesc(&bd);
     if (StereoOn11()) EnsureEyes(bd.Width, bd.Height, bd.Format);
@@ -2653,8 +2857,12 @@ void VrFrame11(IDXGISwapChain* sc) {
             ID3D11Resource* src = bb;
             if (bd.SampleDesc.Count > 1) { g_imm->ResolveSubresource(g_panel11Resolve, 0, bb, 0, bd.Format); src = g_panel11Resolve; }
             OC(g_imm, CopySubresourceRegion)(g_imm, g_panel11, 0, 0, 0, 0, src, 0, nullptr);
+            mouse::Draw(g_dev, g_imm, g_panel11, bd.Width, bd.Height);
             if (menuOpen) CopyMenu(g_panel11, 0, bd.Width, bd.Height, bd.Format);
             panel = g_panel11;
+        } else if (hudLayer && g_hudConvFrame == G().frame) {
+            D3D11_TEXTURE2D_DESC hd{}; g_hudTex->GetDesc(&hd);
+            mouse::Draw(g_dev, g_imm, g_hudTex, hd.Width, hd.Height);
         }
         VrsOffForMod(g_imm);   // the mod's own passes (sharpening, menu, copies) at full rate
         if (stereo && g_f.mainEmOk) vrs::Frame(g_dev, g_imm, g_eyeW, g_eyeH, g_f.mainEm.Pe[0], g_f.mainEm.Pe[1]);
@@ -2856,6 +3064,7 @@ HRESULT STDMETHODCALLTYPE Hk_Present(IDXGISwapChain* sc, UINT sync, UINT flags) 
             lastGen = gen;
         }
         static uint64_t lastSub = 0, lastSkip = 0;
+        mouse::Status();
         LOGI("d3d11 vr: %llu frames to the headset, %llu skipped (slot busy), host %s", (unsigned long long)(g_vrSubmitted - lastSub),
              (unsigned long long)(g_vrSkipped - lastSkip), xrb::ClientHostVisible() ? "visible" : xrb::ClientHostConnected() ? "connected" : "not connected");
         lastSub = g_vrSubmitted; lastSkip = g_vrSkipped;
@@ -2930,7 +3139,7 @@ static void DecideRenderSize(UINT gameW, UINT gameH) {
 }
 // Live render_scale: new forced size, then the game window is resized to it; GreedFall (windowed) answers with
 // ResizeBuffers and recreates its targets at the new size (the eye textures follow the back buffer).
-static HWND g_scHwnd = nullptr;
+HWND g_scHwnd = nullptr;
 bool ApplyRenderScaleImpl() {
     const Settings& s = G().s;
     if (!g_forceW || !g_scHwnd) { LOGW("render size: the headset resolution is not in use - restart the game to apply"); return false; }
